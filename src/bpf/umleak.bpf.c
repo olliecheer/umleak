@@ -23,8 +23,10 @@ struct alloc_t {
 
 struct stack_alloc_t {
     u32 stack_id;
-    u64 total_size;
-    u64 count;
+    // this struct will be store in per-cpu map,
+    // possibly negative value if alloc and free are running on different cpu
+    s64 total_size;
+    s64 count;
 };
 
 #define ALLOC_CONTEXT_NR 1024
@@ -46,7 +48,7 @@ struct {
 } allocs SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
     __type(key, u32); // stack_id
     __type(value, struct stack_alloc_t); // accumulated alloc info
     __uint(max_entries, ALLOC_STACK_NR); 
@@ -57,6 +59,16 @@ struct {
     __type(key, u32);
     __uint(max_entries, ALLOC_STACK_NR);
 } stack_traces SEC(".maps");
+
+static struct stack_alloc_t *init_stack_allocs_map(u32 stack_id) {
+    struct stack_alloc_t init = {};
+    init.stack_id = stack_id;
+    if(bpf_map_update_elem(&stack_allocs, &stack_id, &init, BPF_NOEXIST) < 0) {
+            return NULL;
+    }
+
+    return bpf_map_lookup_elem(&stack_allocs, &stack_id);
+}
 
 static int enter_alloc(size_t size) {
     if(size == 0 || size > -1) {
@@ -111,17 +123,10 @@ static int exit_alloc(struct pt_regs *ctx) {
     struct stack_alloc_t *stack_info = bpf_map_lookup_elem(&stack_allocs, &info.stack_id);
     
     if (!stack_info) {
-        struct stack_alloc_t init = {};
-        init.stack_id = info.stack_id;
-        if(bpf_map_update_elem(&stack_allocs, &info.stack_id, &init, BPF_NOEXIST) < 0) {
-            // print("%s: pid = %lu, addr = %p, size = %llu, stack_id = %lu update map stack_alloc on not exist failed",
-            //     __FUNCTION__, pid, addr, info.size, info.stack_id);
-            return 1;
-        }
-        stack_info = bpf_map_lookup_elem(&stack_allocs, &info.stack_id);
-        if(!stack_info) {
-            // print("%s: pid = %lu, addr = %p, size = %llu, stack_id = %lu look up stack_allocs failed after retry",
-            //     __FUNCTION__, pid, addr, info.size, info.stack_id);
+        stack_info = init_stack_allocs_map(info.stack_id);
+        if (!stack_info) {
+            print("%s: pid = %lu, stack_id = %lu look up stack_allocs failed after retry !!!",
+                __FUNCTION__, pid, info.stack_id);
             return 1;
         }
     }
@@ -156,8 +161,12 @@ static int enter_free(void* address) {
     struct stack_alloc_t *stack_info = bpf_map_lookup_elem(&stack_allocs, &stack_id);
 
     if(!stack_info) {
-        print("%s: stack_id = %lu lookup stack info failed", __FUNCTION__, stack_id);
-        return 1;
+        stack_info = init_stack_allocs_map(stack_id);
+        if (!stack_info) {
+            print("%s: addr = %p, stack_id = %lu look up stack_allocs failed after retry !!!",
+                __FUNCTION__, addr, stack_id);
+            return 1;
+        }
     }
     
     // check concurrency here

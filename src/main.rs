@@ -16,15 +16,17 @@ use umleak::*;
 #[derive(Default)]
 struct StackAlloc {
     stack_id: u32,
-    total_size: u64,
-    count: u64,
+    total_size: i64,
+    count: i64,
 }
 unsafe impl Plain for StackAlloc {}
 
 #[derive(Debug, StructOpt)]
 struct Command {
     #[structopt(long, short)]
-    verbose: bool,
+    debug: bool,
+    #[structopt(long, short)]
+    symbolize: bool,
     #[structopt(long, short, default_value = "/usr/lib/libc.so.6")]
     glibc: String,
     #[structopt(long, short)]
@@ -39,7 +41,7 @@ fn main() -> Result<()> {
     let opts = Command::from_args();
 
     let mut skel_builder = UmleakSkelBuilder::default();
-    skel_builder.obj_builder.debug(opts.verbose);
+    skel_builder.obj_builder.debug(opts.debug);
 
     let mut open_skel = if let Some(btf_path) = opts.btf_file {
         skel_builder.open_opts(bpf_object_open_opts {
@@ -173,7 +175,7 @@ fn main() -> Result<()> {
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(opts.interval));
-        print_snapshot(stack_allocs_map, stack_traces_map, &do_symbolize)?;
+        print_snapshot(stack_allocs_map, stack_traces_map, opts.symbolize, &do_symbolize)?;
         println!();
     }
 }
@@ -181,16 +183,24 @@ fn main() -> Result<()> {
 fn print_snapshot(
     stack_allocs_map: &Map,
     stack_traces_map: &Map,
+    enable_sym: bool,
     do_symbolize: &dyn Fn(&[usize]) -> Result<Vec<Vec<Sym>>>,
 ) -> Result<()> {
     println!("{:?}", chrono::offset::Local::now());
     let mut stacks_info = Vec::<StackAlloc>::new();
-    for stack_id in stack_allocs_map.keys() {
-        if let Some(v) = stack_allocs_map.lookup(&stack_id, MapFlags::ANY)? {
-            let mut stack_alloc_info = StackAlloc::default();
-            plain::copy_from_bytes::<StackAlloc>(&mut stack_alloc_info, &v)
-                .expect("convert bytes to StackAlloc failed");
-            stacks_info.push(stack_alloc_info);
+    for stack_id_bytes in stack_allocs_map.keys() {
+        if let Some(v_percpu) = stack_allocs_map.lookup_percpu(&stack_id_bytes, MapFlags::ANY)? {
+            let mut combined = StackAlloc {
+                stack_id: u32::from_ne_bytes(stack_id_bytes.try_into().expect("convert bytes to stack_id failed")),
+                ..Default::default()
+            };
+            for v in v_percpu {
+                let stack_alloc_info = plain::from_bytes::<StackAlloc>(&v)
+                    .expect("convert bytes to StackAlloc failed");
+                combined.count += stack_alloc_info.count;
+                combined.total_size += stack_alloc_info.total_size;
+            }
+            stacks_info.push(combined);
         }
     }
 
@@ -209,7 +219,11 @@ fn print_snapshot(
                     stack_bytes.len() / std::mem::size_of::<usize>(),
                 )
             };
-            let syms = do_symbolize(stack)?;
+            let syms = if enable_sym {
+                do_symbolize(stack)?
+            } else {
+                vec![Vec::<Sym>::new(); stack.len()]
+            };
             do_print_stack(stack, syms);
         }
     }
