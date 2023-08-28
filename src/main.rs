@@ -24,10 +24,10 @@ unsafe impl Plain for StackAlloc {}
 #[derive(Debug, StructOpt)]
 struct Command {
     #[structopt(long, short)]
-    debug: bool,
+    verbose: bool,
     #[structopt(long, short)]
     symbolize: bool,
-    #[structopt(long, short, default_value = "/usr/lib/libc.so.6")]
+    #[structopt(long, short, default_value = "libc.so.6")]
     glibc: String,
     #[structopt(long, short)]
     btf_file: Option<String>,
@@ -35,17 +35,20 @@ struct Command {
     pid: i32,
     #[structopt(long, short, default_value = "3")]
     interval: u64,
+    #[structopt(long, short, default_value = "8")]
+    min_size: u64,
 }
 
 fn main() -> Result<()> {
     let opts = Command::from_args();
 
     let mut skel_builder = UmleakSkelBuilder::default();
-    skel_builder.obj_builder.debug(opts.debug);
+    skel_builder.obj_builder.debug(opts.verbose);
 
     let mut open_skel = if let Some(btf_path) = opts.btf_file {
         skel_builder.open_opts(bpf_object_open_opts {
             btf_custom_path: btf_path.as_ptr() as *const i8,
+            sz: std::mem::size_of::<bpf_object_open_opts>() as u64,
             ..Default::default()
         })?
     } else {
@@ -175,7 +178,7 @@ fn main() -> Result<()> {
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(opts.interval));
-        print_snapshot(stack_allocs_map, stack_traces_map, opts.symbolize, &do_symbolize)?;
+        print_snapshot(stack_allocs_map, stack_traces_map, opts.symbolize, opts.min_size, &do_symbolize)?;
         println!();
     }
 }
@@ -184,6 +187,7 @@ fn print_snapshot(
     stack_allocs_map: &Map,
     stack_traces_map: &Map,
     enable_sym: bool,
+    min_size: u64,
     do_symbolize: &dyn Fn(&[usize]) -> Result<Vec<Vec<Sym>>>,
 ) -> Result<()> {
     println!("{:?}", chrono::offset::Local::now());
@@ -200,7 +204,10 @@ fn print_snapshot(
                 combined.count += stack_alloc_info.count;
                 combined.total_size += stack_alloc_info.total_size;
             }
-            stacks_info.push(combined);
+
+            if combined.total_size >= min_size as i64 {
+                stacks_info.push(combined);
+            }
         }
     }
 
